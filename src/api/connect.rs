@@ -735,6 +735,30 @@ impl Agent for AgentServiceHandler {
                         match execute_with_bwrap(command, spawn_opts).await {
                             Ok(ExecutorResult { handle, pid }) => {
                                 let job_id = handle.id.clone();
+                                
+                                // Save process to database
+                                let process_data = CreateProcessData {
+                                    id: job_id.clone(),
+                                    command: command.to_string(),
+                                    cwd: workdir.to_string(),
+                                    parent_session_id: Some(effective_session_id.clone()),
+                                    unit_name: format!("openzerg-{}.scope", &job_id[..8.min(job_id.len())]),
+                                    output_dir: handle.output_dir.clone(),
+                                    timeout_ms: Some(0),
+                                };
+                                
+                                if let Err(e) = self.storage.save_process(process_data).await {
+                                    return Ok((
+                                        ExecuteToolResponse {
+                                            title: "Error".into(),
+                                            output: format!("Failed to save process: {}", e).into(),
+                                            metadataJson: r#"{"error":true}"#.into(),
+                                            ..ExecuteToolResponse::default()
+                                        },
+                                        ctx,
+                                    ));
+                                }
+                                
                                 let output = format!(
                                     "Job {} started in background.\n\nTo check output: job(action=\"output\", job_id=\"{}\")",
                                     job_id, job_id
