@@ -6,14 +6,31 @@ use std::pin::Pin;
 use futures::Stream;
 use std::sync::Arc;
 use std::process::Command;
+use std::path::PathBuf;
+use std::fs;
 use crate::core::interfaces::{Storage, NewProvider, NewExternalTool, CreateRegistryData, ProcessListFilter};
 use crate::core::types::{
     Session, CreateSessionData, UpdateSessionData, SessionState, AgentMode,
     Provider, Message, CreateMessageData, MessageRole,
-    Process, CreateProcessData, ProcessStatus,
+    Process, CreateProcessData, ProcessStatus, SpawnOptions,
 };
 use crate::core::constants::{HIDDEN_SESSION_ID, is_hidden_session};
+use crate::process_manager::{execute_with_bwrap, ExecutorResult};
 use chrono::Utc;
+
+fn get_bwrap_path() -> String {
+    let candidates = vec![
+        "/run/current-system/sw/bin/bwrap",
+        "/usr/bin/bwrap",
+        "bwrap",
+    ];
+    for candidate in candidates {
+        if PathBuf::from(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+    "bwrap".to_string()
+}
 
 fn internal_error(msg: impl Into<String>) -> ConnectError {
     ConnectError::new(ErrorCode::Internal, msg.into())
@@ -629,11 +646,16 @@ impl Agent for AgentServiceHandler {
                     let timeout = args.get("timeout").and_then(|v| v.as_i64()).unwrap_or(300000) as i32;
                     
                     let session_id = request.session_id.unwrap_or("");
+                    let effective_session_id = if session_id.is_empty() {
+                        HIDDEN_SESSION_ID.to_string()
+                    } else {
+                        session_id.to_string()
+                    };
                     let process_data = CreateProcessData {
                         id: job_id.clone(),
                         command: command.to_string(),
                         cwd: workdir.to_string(),
-                        parent_session_id: Some(session_id.to_string()),
+                        parent_session_id: Some(effective_session_id.clone()),
                         unit_name: format!("job-{}", job_id),
                         output_dir: format!("/tmp/{}", job_id),
                         timeout_ms: Some(timeout),
@@ -643,16 +665,38 @@ impl Agent for AgentServiceHandler {
                         .map_err(|e| internal_error(&e.to_string()))?;
                     
                     if wait == Some(true) {
-                        let result = Command::new("sh")
-                            .arg("-c")
-                            .arg(command)
-                            .current_dir(workdir)
-                            .output();
-
-                        match result {
-                            Ok(output) => {
-                                let exit_code = output.status.code().unwrap_or(-1);
-                                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                        let spawn_opts = SpawnOptions {
+                            workdir: workdir.to_string(),
+                            timeout: 0,
+                            session_id: Some(effective_session_id.clone()),
+                            env: None,
+                        };
+                        
+                        match execute_with_bwrap(command, spawn_opts).await {
+                            Ok(ExecutorResult { handle, pid }) => {
+                                let output_dir = handle.output_dir.clone();
+                                let job_id = handle.id.clone();
+                                
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                
+                                let stdout_path = PathBuf::from(&output_dir).join("stdout");
+                                let exitcode_path = PathBuf::from(&output_dir).join("exitcode");
+                                
+                                let mut retries = 0;
+                                while retries < 100 {
+                                    if exitcode_path.exists() {
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                    retries += 1;
+                                }
+                                
+                                let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+                                let exit_code: i32 = fs::read_to_string(&exitcode_path)
+                                    .ok()
+                                    .and_then(|s| s.trim().parse().ok())
+                                    .unwrap_or(-1);
+                                
                                 let status = if exit_code == 0 { "Completed" } else { "Failed" };
 
                                 crate::tools::job::JOB_OUTPUTS.lock().unwrap().insert(job_id.clone(), stdout.clone());
@@ -662,7 +706,7 @@ impl Agent for AgentServiceHandler {
                                     ExecuteToolResponse {
                                         title: "Job Completed".into(),
                                         output: output_text.into(),
-                                        metadataJson: format!(r#"{{"job_id":"{}","pid":12345,"exit_code":{},"status":"{}"}}"#, job_id, exit_code, status).into(),
+                                        metadataJson: format!(r#"{{"job_id":"{}","pid":{},"exit_code":{},"status":"{}"}}"#, job_id, pid, exit_code, status).into(),
                                         ..ExecuteToolResponse::default()
                                     },
                                     ctx,
@@ -672,7 +716,7 @@ impl Agent for AgentServiceHandler {
                                 return Ok((
                                     ExecuteToolResponse {
                                         title: "Error".into(),
-                                        output: format!("Failed to execute command: {}", e).into(),
+                                        output: format!("Failed to start job: {}", e).into(),
                                         metadataJson: r#"{"error":true}"#.into(),
                                         ..ExecuteToolResponse::default()
                                     },
@@ -681,19 +725,42 @@ impl Agent for AgentServiceHandler {
                             }
                         }
                     } else {
-                        let output = format!(
-                            "Job {} started in background.\n\nTo check output: job(action=\"output\", job_id=\"{}\")",
-                            job_id, job_id
-                        );
-                        return Ok((
-                            ExecuteToolResponse {
-                                title: "Job Started".into(),
-                                output: output.into(),
-                                metadataJson: format!(r#"{{"job_id":"{}","pid":12345,"output_dir":"/tmp/{}"}}"#, job_id, job_id).into(),
-                                ..ExecuteToolResponse::default()
-                            },
-                            ctx,
-                        ));
+                        let spawn_opts = SpawnOptions {
+                            workdir: workdir.to_string(),
+                            timeout: 0,
+                            session_id: Some(effective_session_id.clone()),
+                            env: None,
+                        };
+                        
+                        match execute_with_bwrap(command, spawn_opts).await {
+                            Ok(ExecutorResult { handle, pid }) => {
+                                let job_id = handle.id.clone();
+                                let output = format!(
+                                    "Job {} started in background.\n\nTo check output: job(action=\"output\", job_id=\"{}\")",
+                                    job_id, job_id
+                                );
+                                return Ok((
+                                    ExecuteToolResponse {
+                                        title: "Job Started".into(),
+                                        output: output.into(),
+                                        metadataJson: format!(r#"{{"job_id":"{}","pid":{}}}"#, job_id, pid).into(),
+                                        ..ExecuteToolResponse::default()
+                                    },
+                                    ctx,
+                                ));
+                            }
+                            Err(e) => {
+                                return Ok((
+                                    ExecuteToolResponse {
+                                        title: "Error".into(),
+                                        output: format!("Failed to start job: {}", e).into(),
+                                        metadataJson: r#"{"error":true}"#.into(),
+                                        ..ExecuteToolResponse::default()
+                                    },
+                                    ctx,
+                                ));
+                            }
+                        }
                     }
                 }
                 
@@ -1439,7 +1506,7 @@ impl Agent for AgentServiceHandler {
             Ok((
                 HealthResponse {
                     healthy: true,
-                    version: "0.1.0".into(),
+                    version: "1.0.0".into(),
                     ..HealthResponse::default()
                 },
                 ctx,

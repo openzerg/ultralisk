@@ -17,7 +17,7 @@ fn default_database_path() -> String {
 #[derive(Parser)]
 #[command(name = "ultralisk")]
 #[command(about = "OpenZerg Agent Server")]
-#[command(version = "0.1.0")]
+#[command(version = "1.0.0")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

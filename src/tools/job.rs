@@ -1,9 +1,26 @@
 use async_trait::async_trait;
 use crate::core::interfaces::tool::{Tool, ToolContext};
 use crate::core::{ToolResult, JSONSchema};
+use crate::process_manager::{execute_with_bwrap, ExecutorResult};
 use std::collections::HashMap;
-use std::process::Command;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::collections::HashMap as StdHashMap;
 use uuid::Uuid;
+
+lazy_static::lazy_static! {
+    pub static ref JOB_OUTPUTS: Mutex<StdHashMap<String, String>> = Mutex::new(StdHashMap::new());
+    pub static ref JOB_PIDS: Mutex<StdHashMap<String, u32>> = Mutex::new(StdHashMap::new());
+    pub static ref JOB_PROCESSES: Mutex<StdHashMap<String, std::process::Child>> = Mutex::new(StdHashMap::new());
+}
+
+fn get_output_base_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".openzerg")
+        .join("processes")
+}
 
 pub struct JobTool;
 
@@ -102,27 +119,48 @@ impl JobTool {
             return error_result("wait parameter is required (must be true or false)");
         }
 
-        let job_id = Uuid::new_v4().to_string();
-        
-        if wait == Some(true) {
-            let output = Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(workdir)
-                .output();
+        let spawn_opts = crate::core::SpawnOptions {
+            workdir: workdir.to_string(),
+            timeout: 0,
+            session_id: Some(context.session_id.clone()),
+            env: None,
+        };
 
-            match output {
-                Ok(output) => {
-                    let exit_code = output.status.code().unwrap_or(-1);
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    let _stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let result = execute_with_bwrap(command, spawn_opts).await;
+
+        match result {
+            Ok(ExecutorResult { handle, pid }) => {
+                let job_id = handle.id.clone();
+                let output_dir = handle.output_dir.clone();
+
+                if wait == Some(true) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    
+                    let stdout_path = PathBuf::from(&output_dir).join("stdout");
+                    let exitcode_path = PathBuf::from(&output_dir).join("exitcode");
+                    
+                    let mut retries = 0;
+                    while retries < 100 {
+                        if exitcode_path.exists() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        retries += 1;
+                    }
+
+                    let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+                    let exit_code: i32 = fs::read_to_string(&exitcode_path)
+                        .ok()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(-1);
 
                     JOB_OUTPUTS.lock().unwrap().insert(job_id.clone(), stdout.clone());
-                    
+
                     let mut metadata = HashMap::new();
                     metadata.insert("job_id".to_string(), serde_json::json!(job_id));
                     metadata.insert("exit_code".to_string(), serde_json::json!(exit_code));
                     metadata.insert("status".to_string(), serde_json::json!(if exit_code == 0 { "Completed" } else { "Failed" }));
+                    metadata.insert("pid".to_string(), serde_json::json!(pid));
 
                     ToolResult {
                         title: "Job Completed".to_string(),
@@ -132,22 +170,24 @@ impl JobTool {
                         truncated: false,
                         success: Some(exit_code == 0),
                     }
-                }
-                Err(e) => error_result(format!("Failed to execute command: {}", e)),
-            }
-        } else {
-            let mut metadata = HashMap::new();
-            metadata.insert("job_id".to_string(), serde_json::json!(job_id));
-            metadata.insert("pid".to_string(), serde_json::json!(12345));
+                } else {
+                    JOB_PIDS.lock().unwrap().insert(job_id.clone(), pid);
 
-            ToolResult {
-                title: "Job Started".to_string(),
-                output: format!("Job {} started in background.\n\nTo check output: job(action=\"output\", job_id=\"{}\")", job_id, job_id),
-                metadata,
-                attachments: Vec::new(),
-                truncated: false,
-                success: Some(true),
+                    let mut metadata = HashMap::new();
+                    metadata.insert("job_id".to_string(), serde_json::json!(job_id));
+                    metadata.insert("pid".to_string(), serde_json::json!(pid));
+
+                    ToolResult {
+                        title: "Job Started".to_string(),
+                        output: format!("Job {} started in background.\n\nTo check output: job(action=\"output\", job_id=\"{}\")", job_id, job_id),
+                        metadata,
+                        attachments: Vec::new(),
+                        truncated: false,
+                        success: Some(true),
+                    }
+                }
             }
+            Err(e) => error_result(format!("Failed to start job: {}", e)),
         }
     }
 
@@ -252,11 +292,4 @@ fn error_result(message: impl Into<String>) -> ToolResult {
         truncated: false,
         success: Some(false),
     }
-}
-
-use std::sync::Mutex;
-use std::collections::HashMap as StdHashMap;
-
-lazy_static::lazy_static! {
-    pub static ref JOB_OUTPUTS: Mutex<StdHashMap<String, String>> = Mutex::new(StdHashMap::new());
 }

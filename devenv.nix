@@ -9,6 +9,12 @@ let
     nativeBuildInputs = [ pkgs.pkg-config pkgs.protobuf ];
     buildInputs = [ pkgs.openssl pkgs.sqlite ];
   };
+  
+  ultralisk-runtime = pkgs.buildEnv {
+    name = "ultralisk-runtime";
+    paths = [ ultralisk-app pkgs.bubblewrap pkgs.cacert pkgs.sqlite pkgs.bash ];
+    pathsToLink = [ "/bin" "/etc" ];
+  };
 in
 {
   languages.rust = {
@@ -33,12 +39,8 @@ in
 
   containers.ultralisk = {
     name = "ultralisk";
-    copyToRoot = [ 
-      ultralisk-app 
-      pkgs.cacert
-      pkgs.sqlite
-    ];
-    startupCommand = "${ultralisk-app}/bin/ultralisk serve --host 0.0.0.0 --port 15317";
+    copyToRoot = [ ultralisk-runtime ];
+    startupCommand = "PATH=${ultralisk-runtime}/bin:$PATH ${ultralisk-runtime}/bin/ultralisk serve --host 0.0.0.0 --port 15317";
   };
 
   tasks = {
