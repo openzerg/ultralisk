@@ -1,0 +1,16 @@
+# Binaries
+target/
+
+# Database files
+*.db
+*.db-wal
+*.db-shm
+
+# Nix
+.direnv/
+result
+
+# Devenv
+.devenv/
+devenv.local.nix
+devenv.local.yaml
